@@ -1,0 +1,181 @@
+import pandas as pd
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import Dense, LSTM, Input, Dropout, Attention, Concatenate
+from tensorflow.keras.layers import LayerNormalization, MultiHeadAttention, GlobalAveragePooling1D
+
+
+# Setup directories
+os.makedirs("DataTFT/graphics", exist_ok=True)
+os.makedirs("DataTFT/CSV", exist_ok=True)
+
+# Load Data
+data = pd.read_csv("/content/Data TFT.csv")
+data['Date'] = pd.to_datetime(data['Date'], format='%d/%m/%Y', errors='coerce')
+data['Year'] = data['Date'].dt.year
+data['Month'] = data['Date'].dt.month
+data['Day'] = data['Date'].dt.day
+data['DayOfWeek'] = data['Date'].dt.dayofweek
+
+# Features
+features = [
+    'Year', 'Month', 'Day', 'DayOfWeek',
+    'Hydraulic Head', 'Precipitation',
+    'Distance_From_Sea', 'Hydraulic_Conductivity',
+    'Specific_Yield'
+]
+
+# Data Preparation
+X = data[features]
+y = data['TDS']
+
+imputer = SimpleImputer(strategy='mean')
+X_imputed = pd.DataFrame(imputer.fit_transform(X), columns=X.columns)
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X_imputed)
+
+# Train/Test Split
+X_train, X_test, y_train, y_test, dates_train, dates_test = train_test_split(
+    X_scaled, y, data['Date'], test_size=0.2, random_state=42
+)
+
+X_train_seq = X_train.reshape(-1, 1, X_train.shape[1])
+X_test_seq = X_test.reshape(-1, 1, X_test.shape[1])
+
+# Define models
+
+def build_ff_nn_regression(input_dim):
+    model = Sequential([
+        Dense(64, activation='relu', input_dim=input_dim),
+        Dense(32, activation='relu'),
+        Dense(1, activation='linear')
+    ])
+    model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+    return model
+
+def build_lstm_regression(input_shape):
+    model = Sequential([
+        LSTM(64, activation='tanh', input_shape=input_shape),
+        Dense(32, activation='relu'),
+        Dense(1, activation='linear')
+    ])
+    model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+    return model
+
+def build_transformer_regression(input_shape, num_heads=2, ff_dim=32, dropout_rate=0.1):
+    inputs = Input(shape=input_shape)
+    attention_output = MultiHeadAttention(num_heads=num_heads, key_dim=input_shape[-1])(inputs, inputs)
+    attention_output = Dropout(dropout_rate)(attention_output)
+    out1 = LayerNormalization(epsilon=1e-6)(inputs + attention_output)
+
+    ffn_output = Dense(ff_dim, activation='relu')(out1)
+    ffn_output = Dense(input_shape[-1])(ffn_output)
+    ffn_output = Dropout(dropout_rate)(ffn_output)
+    out2 = LayerNormalization(epsilon=1e-6)(out1 + ffn_output)
+
+    pooled = GlobalAveragePooling1D()(out2)
+    outputs = Dense(1, activation='linear')(pooled)
+
+    model = Model(inputs=inputs, outputs=outputs)
+    model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+    return model
+
+
+def build_lstm_attention(input_shape):
+    inputs = Input(shape=input_shape)
+    lstm_out = LSTM(64, return_sequences=True)(inputs)
+    attention = Attention()([lstm_out, lstm_out])
+    x = GlobalAveragePooling1D()(attention)
+    x = Dense(32, activation='relu')(x)
+    outputs = Dense(1)(x)
+    model = Model(inputs, outputs)
+    model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+    return model
+
+
+def build_hybrid_lstm_ffnn(lstm_input_shape, static_input_dim):
+    lstm_input = Input(shape=lstm_input_shape)
+    lstm_out = LSTM(32, activation='tanh')(lstm_input)
+    
+    static_input = Input(shape=(static_input_dim,))
+    static_out = Dense(32, activation='relu')(static_input)
+    
+    concat = Concatenate()([lstm_out, static_out])
+    dense_out = Dense(32, activation='relu')(concat)
+    output = Dense(1)(dense_out)
+    
+    model = Model(inputs=[lstm_input, static_input], outputs=output)
+    model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+    return model
+
+
+
+
+
+# Train models
+ff_model = build_ff_nn_regression(X_train.shape[1])
+ff_model.fit(X_train, y_train, epochs=500, batch_size=64)
+
+lstm_model = build_lstm_regression(X_train_seq.shape[1:])
+lstm_model.fit(X_train_seq, y_train, epochs=500, batch_size=64)
+
+transformer_model = build_transformer_regression(X_train_seq.shape[1:])
+transformer_model.fit(X_train_seq, y_train, epochs=500, batch_size=64)
+
+lstm_attention_model = build_lstm_attention(X_train_seq.shape[1:])
+lstm_attention_model.fit(X_train_seq, y_train, epochs=500, batch_size=64)
+
+hybrid_model = build_hybrid_lstm_ffnn(X_train_seq.shape[1:], X_train.shape[1])
+hybrid_model.fit([X_train_seq, X_train], y_train, epochs=500, batch_size=64, verbose=1)
+
+
+# Predictions
+y_pred_ff = ff_model.predict(X_test).flatten()
+y_pred_lstm = lstm_model.predict(X_test_seq).flatten()
+y_pred_transformer = transformer_model.predict(X_test_seq).flatten()
+y_pred_attention = lstm_attention_model.predict(X_test_seq).flatten()
+y_pred_hybrid = hybrid_model.predict([X_test_seq, X_test]).flatten()
+
+
+# Save Actual vs Predicted
+results_df = pd.DataFrame({
+    'Date': dates_test,
+    'Actual': y_test,
+    'FF_NN': y_pred_ff,
+    'LSTM': y_pred_lstm,
+    'Transformer': y_pred_transformer,
+    'LSTM_Attention': y_pred_attention,
+    'Hybrid_LSTM_FFNN': y_pred_hybrid
+
+}).sort_values(by='Date')
+
+results_df.to_csv("DataTFT/CSV/actual_vs_predicted.csv", index=False)
+
+# Plot separately for each model
+models = ['FF_NN', 'LSTM', 'Transformer', 'LSTM_Attention', 'Hybrid_LSTM_FFNN']
+
+for model in models:
+    plt.figure(figsize=(12,6))
+    plt.plot(results_df['Date'], results_df['Actual'], label='Actual', color='black', linewidth=2)
+    plt.plot(results_df['Date'], results_df[model], label=f'Predicted ({model})', linestyle='dashed')
+    plt.title(f"Actual vs Predicted TDS - {model}")
+    plt.xlabel('Date')
+    plt.ylabel('TDS')
+    plt.xticks(rotation=45)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"DataTFT/graphics/actual_vs_predicted_{model}.png", dpi=300)
+    plt.close()
+
+print("Actual vs Predicted results saved in 'DataTFT/CSV/actual_vs_predicted.csv'")
+print("Plots saved in 'DataTFT/graphics/' directory.")
